@@ -1,0 +1,11 @@
+name = "gallery-d1-worker"
+main = "index.js"
+compatibility_date = "2026-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "test"
+database_id = "YOUR_DATABASE_ID_HERE"
+
+[triggers]
+crons = ["0 0 * * *"]
