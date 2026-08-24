@@ -1,4 +1,3 @@
-// Standard CORS headers allowing unrestricted access from any website/client
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -10,17 +9,13 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 1. Handle CORS preflight requests (OPTIONS method)
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders,
-      });
+      return new Response(null, { status: 204, headers: corsHeaders });
     }
 
     await checkAndResetCounter(env);
 
-    // 2. GET /api/gallery - Fetch images from D1 with Raindrop fallback
+    // GET /api/gallery
     if (path === "/api/gallery" && request.method === "GET") {
       try {
         const fetchLimit = parseInt(env.FETCH_LIMIT || "50", 10);
@@ -41,24 +36,43 @@ export default {
           results = results.concat(raindropItems);
         }
 
-        return Response.json(
-          { success: true, count: results.length, data: results },
-          { headers: corsHeaders }
-        );
+        return Response.json({ success: true, count: results.length, data: results }, { headers: corsHeaders });
       } catch (error) {
-        return Response.json(
-          { success: false, error: error.message },
-          { status: 500, headers: corsHeaders }
-        );
+        return Response.json({ success: false, error: error.message }, { status: 500, headers: corsHeaders });
       }
     }
 
-    // 3. POST /api/upload - Upload batch images with fallback logic
+    // POST /api/upload - Accepts base64 images and uploads to ImgBB using secret key
     if (path === "/api/upload" && request.method === "POST") {
       try {
-        const { folderName, imageUrls } = await request.json();
+        const { folderName, base64Images } = await request.json();
+        
+        if (!base64Images || !base64Images.length) {
+          return Response.json({ success: false, error: "No image files provided." }, { status: 400, headers: corsHeaders });
+        }
+
         const requestLimit = parseInt(env.REQUEST_LIMIT || "95000", 10);
-        const currentUsage = await incrementUsageCounter(env, imageUrls.length);
+        const currentUsage = await incrementUsageCounter(env, base64Images.length);
+
+        let imageUrls = [];
+
+        // Upload images to ImgBB via Worker environment secret
+        for (const base64Data of base64Images) {
+          const formData = new FormData();
+          formData.append("image", base64Data);
+
+          const imgbbRes = await fetch(`https://api.imgbb.com/1/upload?key=${env.IMGBB_API_KEY}`, {
+            method: "POST",
+            body: formData
+          });
+
+          const imgbbJson = await imgbbRes.json();
+          if (imgbbJson.success) {
+            imageUrls.push(imgbbJson.data.url);
+          } else {
+            throw new Error(`ImgBB API Error: ${imgbbJson.error ? imgbbJson.error.message : 'Upload failed'}`);
+          }
+        }
 
         let storageUsed = "Cloudflare D1";
 
@@ -77,15 +91,9 @@ export default {
           )
         );
 
-        return Response.json(
-          { success: true, storageUsed, totalUsageToday: currentUsage },
-          { headers: corsHeaders }
-        );
+        return Response.json({ success: true, storageUsed, totalUsageToday: currentUsage }, { headers: corsHeaders });
       } catch (error) {
-        return Response.json(
-          { success: false, error: error.message },
-          { status: 500, headers: corsHeaders }
-        );
+        return Response.json({ success: false, error: error.message }, { status: 500, headers: corsHeaders });
       }
     }
 
