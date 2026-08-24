@@ -49,7 +49,7 @@ export default {
       }
     }
 
-    // POST /api/upload - Upload base64 images via ImgBB secret & store in D1
+    // POST /api/upload - Accurate 1-by-1 image splitting
     if (path === "/api/upload" && request.method === "POST") {
       try {
         const { folderName, base64Images } = await request.json();
@@ -61,12 +61,16 @@ export default {
           );
         }
 
-        const requestLimit = parseInt(env.REQUEST_LIMIT || "95000", 10);
-        const currentUsage = await incrementUsageCounter(env, base64Images.length);
+        const requestLimit = parseInt(env.REQUEST_LIMIT || "3", 10);
 
+        // Fetch current daily count of images stored today
+        const row = await env.DB.prepare(
+          "SELECT value FROM system_stats WHERE key = 'daily_requests'"
+        ).first();
+        let currentCounter = row ? parseInt(row.value, 10) : 0;
+
+        // 1. Upload all to ImgBB first
         let imageUrls = [];
-
-        // Upload images to ImgBB via worker secret key
         for (const base64Data of base64Images) {
           const formData = new FormData();
           formData.append("image", base64Data);
@@ -84,25 +88,48 @@ export default {
           }
         }
 
-        let storageUsed = "Cloudflare D1";
+        // 2. Separate URLs 1-by-1 against actual image count
+        let d1Urls = [];
+        let raindropUrls = [];
 
-        if (currentUsage > requestLimit) {
-          await saveToRaindrop(env, folderName, imageUrls);
-          storageUsed = "Raindrop.io (Fallback)";
-        } else {
-          await saveToD1(env, folderName, imageUrls);
-          ctx.waitUntil(syncRaindropToD1(env));
+        for (const url of imageUrls) {
+          if (currentCounter < requestLimit) {
+            d1Urls.push(url);
+            currentCounter++; // Track pure image count
+          } else {
+            raindropUrls.push(url);
+          }
+        }
+
+        // 3. Save D1 items & update system stats counter
+        if (d1Urls.length > 0) {
+          await env.DB.prepare(
+            "UPDATE system_stats SET value = ? WHERE key = 'daily_requests'"
+          ).bind(currentCounter).run();
+          
+          await saveToD1(env, folderName, d1Urls);
+        }
+
+        // 4. Save overflow items to Raindrop
+        if (raindropUrls.length > 0) {
+          await saveToRaindrop(env, folderName, raindropUrls);
         }
 
         ctx.waitUntil(
           sendTelegramNotification(
             env, 
-            `Uploaded ${imageUrls.length} image(s) to folder "${folderName}" via ${storageUsed}.`
+            `Processed ${imageUrls.length} image(s): ${d1Urls.length} saved to D1, ${raindropUrls.length} fallback to Raindrop.`
           )
         );
 
         return Response.json(
-          { success: true, storageUsed, totalUsageToday: currentUsage },
+          { 
+            success: true, 
+            d1Saved: d1Urls.length, 
+            raindropSaved: raindropUrls.length,
+            totalImagesToday: currentCounter,
+            limit: requestLimit
+          },
           { headers: corsHeaders }
         );
       } catch (error) {
@@ -149,20 +176,6 @@ export default {
 
 /* --- Helpers --- */
 
-async function incrementUsageCounter(env, count) {
-  await env.DB.prepare(`
-    UPDATE system_stats 
-    SET value = value + ? 
-    WHERE key = 'daily_requests'
-  `).bind(count).run();
-
-  const row = await env.DB.prepare(
-    "SELECT value FROM system_stats WHERE key = 'daily_requests'"
-  ).first();
-
-  return row ? row.value : 0;
-}
-
 async function checkAndResetCounter(env) {
   const row = await env.DB.prepare(
     "SELECT last_reset FROM system_stats WHERE key = 'daily_requests'"
@@ -178,7 +191,6 @@ async function checkAndResetCounter(env) {
   }
 }
 
-// Fixed D1 storage logic
 async function saveToD1(env, folderName, imageUrls) {
   let folder = await env.DB.prepare("SELECT id FROM folders WHERE name = ?")
     .bind(folderName)
