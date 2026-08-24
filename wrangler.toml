@@ -5,7 +5,7 @@ compatibility_date = "2026-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "test"
-database_id = "YOUR_DATABASE_ID_HERE"
+database_id = "6ade89d0-d9fe-4b33-af94-fa498c4330b4"
 
 [triggers]
 crons = ["0 0 * * *"]
