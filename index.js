@@ -1,60 +1,95 @@
+// Standard CORS headers allowing unrestricted access from any website/client
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // 1. Handle CORS preflight requests (OPTIONS method)
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders,
+      });
+    }
+
     await checkAndResetCounter(env);
 
-    // GET /api/gallery - Fetch images from D1 with Raindrop fallback
+    // 2. GET /api/gallery - Fetch images from D1 with Raindrop fallback
     if (path === "/api/gallery" && request.method === "GET") {
-      const fetchLimit = parseInt(env.FETCH_LIMIT || "50", 10);
-      
-      const d1Images = await env.DB.prepare(`
-        SELECT images.id, images.imgbb_url, folders.name as folder_name 
-        FROM images 
-        JOIN folders ON images.folder_id = folders.id 
-        ORDER BY images.id DESC
-        LIMIT ?
-      `).bind(fetchLimit).all();
+      try {
+        const fetchLimit = parseInt(env.FETCH_LIMIT || "50", 10);
+        
+        const d1Images = await env.DB.prepare(`
+          SELECT images.id, images.imgbb_url, folders.name as folder_name 
+          FROM images 
+          JOIN folders ON images.folder_id = folders.id 
+          ORDER BY images.id DESC
+          LIMIT ?
+        `).bind(fetchLimit).all();
 
-      let results = d1Images.results || [];
+        let results = d1Images.results || [];
 
-      if (results.length < fetchLimit) {
-        const remainingCapacity = fetchLimit - results.length;
-        const raindropItems = await fetchRaindropImages(env, remainingCapacity);
-        results = results.concat(raindropItems);
+        if (results.length < fetchLimit) {
+          const remainingCapacity = fetchLimit - results.length;
+          const raindropItems = await fetchRaindropImages(env, remainingCapacity);
+          results = results.concat(raindropItems);
+        }
+
+        return Response.json(
+          { success: true, count: results.length, data: results },
+          { headers: corsHeaders }
+        );
+      } catch (error) {
+        return Response.json(
+          { success: false, error: error.message },
+          { status: 500, headers: corsHeaders }
+        );
       }
-
-      return Response.json({ success: true, count: results.length, data: results });
     }
 
-    // POST /api/upload - Upload batch images with dynamic fallback logic
+    // 3. POST /api/upload - Upload batch images with fallback logic
     if (path === "/api/upload" && request.method === "POST") {
-      const { folderName, imageUrls } = await request.json();
-      const requestLimit = parseInt(env.REQUEST_LIMIT || "95000", 10);
-      const currentUsage = await incrementUsageCounter(env, imageUrls.length);
+      try {
+        const { folderName, imageUrls } = await request.json();
+        const requestLimit = parseInt(env.REQUEST_LIMIT || "95000", 10);
+        const currentUsage = await incrementUsageCounter(env, imageUrls.length);
 
-      let storageUsed = "Cloudflare D1";
+        let storageUsed = "Cloudflare D1";
 
-      if (currentUsage > requestLimit) {
-        await saveToRaindrop(env, folderName, imageUrls);
-        storageUsed = "Raindrop.io (Fallback)";
-      } else {
-        await saveToD1(env, folderName, imageUrls);
-        ctx.waitUntil(syncRaindropToD1(env));
+        if (currentUsage > requestLimit) {
+          await saveToRaindrop(env, folderName, imageUrls);
+          storageUsed = "Raindrop.io (Fallback)";
+        } else {
+          await saveToD1(env, folderName, imageUrls);
+          ctx.waitUntil(syncRaindropToD1(env));
+        }
+
+        ctx.waitUntil(
+          sendTelegramNotification(
+            env, 
+            `Uploaded ${imageUrls.length} image(s) to folder "${folderName}" via ${storageUsed}.`
+          )
+        );
+
+        return Response.json(
+          { success: true, storageUsed, totalUsageToday: currentUsage },
+          { headers: corsHeaders }
+        );
+      } catch (error) {
+        return Response.json(
+          { success: false, error: error.message },
+          { status: 500, headers: corsHeaders }
+        );
       }
-
-      ctx.waitUntil(
-        sendTelegramNotification(
-          env, 
-          `Uploaded ${imageUrls.length} image(s) to folder "${folderName}" via ${storageUsed}.`
-        )
-      );
-
-      return Response.json({ success: true, storageUsed, totalUsageToday: currentUsage });
     }
 
-    return new Response("Endpoint Not Found", { status: 404 });
+    return new Response("Endpoint Not Found", { status: 404, headers: corsHeaders });
   },
 
   async scheduled(event, env, ctx) {
