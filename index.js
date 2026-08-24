@@ -1,6 +1,7 @@
+// Standard CORS headers allowing unrestricted access from any frontend
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
@@ -9,13 +10,17 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // 1. Handle CORS preflight requests (OPTIONS)
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders,
+      });
     }
 
     await checkAndResetCounter(env);
 
-    // GET /api/gallery
+    // 2. GET /api/gallery - Fetch images from D1 with Raindrop fallback
     if (path === "/api/gallery" && request.method === "GET") {
       try {
         const fetchLimit = parseInt(env.FETCH_LIMIT || "50", 10);
@@ -36,19 +41,28 @@ export default {
           results = results.concat(raindropItems);
         }
 
-        return Response.json({ success: true, count: results.length, data: results }, { headers: corsHeaders });
+        return Response.json(
+          { success: true, count: results.length, data: results },
+          { headers: corsHeaders }
+        );
       } catch (error) {
-        return Response.json({ success: false, error: error.message }, { status: 500, headers: corsHeaders });
+        return Response.json(
+          { success: false, error: error.message },
+          { status: 500, headers: corsHeaders }
+        );
       }
     }
 
-    // POST /api/upload - Accepts base64 images and uploads to ImgBB using secret key
+    // 3. POST /api/upload - Accepts base64 images, uploads via ImgBB secret, saves to D1
     if (path === "/api/upload" && request.method === "POST") {
       try {
         const { folderName, base64Images } = await request.json();
         
         if (!base64Images || !base64Images.length) {
-          return Response.json({ success: false, error: "No image files provided." }, { status: 400, headers: corsHeaders });
+          return Response.json(
+            { success: false, error: "No image files provided." },
+            { status: 400, headers: corsHeaders }
+          );
         }
 
         const requestLimit = parseInt(env.REQUEST_LIMIT || "95000", 10);
@@ -56,7 +70,7 @@ export default {
 
         let imageUrls = [];
 
-        // Upload images to ImgBB via Worker environment secret
+        // Upload images to ImgBB using the environment variable secret
         for (const base64Data of base64Images) {
           const formData = new FormData();
           formData.append("image", base64Data);
@@ -91,21 +105,54 @@ export default {
           )
         );
 
-        return Response.json({ success: true, storageUsed, totalUsageToday: currentUsage }, { headers: corsHeaders });
+        return Response.json(
+          { success: true, storageUsed, totalUsageToday: currentUsage },
+          { headers: corsHeaders }
+        );
       } catch (error) {
-        return Response.json({ success: false, error: error.message }, { status: 500, headers: corsHeaders });
+        return Response.json(
+          { success: false, error: error.message },
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    // 4. DELETE /api/gallery/:id - Delete an image by ID from D1
+    if (path.startsWith("/api/gallery/") && request.method === "DELETE") {
+      try {
+        const id = path.split("/").pop();
+        
+        if (!id || isNaN(id)) {
+          return Response.json(
+            { success: false, error: "Invalid Image ID" },
+            { status: 400, headers: corsHeaders }
+          );
+        }
+
+        const result = await env.DB.prepare("DELETE FROM images WHERE id = ?").bind(id).run();
+
+        return Response.json(
+          { success: true, message: `Image ${id} deleted successfully.`, meta: result.meta },
+          { headers: corsHeaders }
+        );
+      } catch (error) {
+        return Response.json(
+          { success: false, error: error.message },
+          { status: 500, headers: corsHeaders }
+        );
       }
     }
 
     return new Response("Endpoint Not Found", { status: 404, headers: corsHeaders });
   },
 
+  // Cron trigger for background sync
   async scheduled(event, env, ctx) {
     ctx.waitUntil(syncRaindropToD1(env));
   }
 };
 
-/* --- Helpers --- */
+/* --- Helper Functions --- */
 
 async function incrementUsageCounter(env, count) {
   await env.DB.prepare(`
@@ -152,6 +199,8 @@ async function saveToD1(env, folderName, imageUrls) {
 }
 
 async function saveToRaindrop(env, folderName, imageUrls) {
+  if (!env.RAINDROP_API_KEY) return;
+
   for (const url of imageUrls) {
     await fetch("https://api.raindrop.io/rest/v1/raindrop", {
       method: "POST",
