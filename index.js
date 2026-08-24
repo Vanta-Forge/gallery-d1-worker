@@ -1,4 +1,3 @@
-// Standard CORS headers allowing unrestricted access from any frontend
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
@@ -10,17 +9,14 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 1. Handle CORS preflight requests (OPTIONS)
+    // Handle CORS preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders,
-      });
+      return new Response(null, { status: 204, headers: corsHeaders });
     }
 
     await checkAndResetCounter(env);
 
-    // 2. GET /api/gallery - Fetch images from D1 with Raindrop fallback
+    // GET /api/gallery - Fetch combined D1 & Raindrop images
     if (path === "/api/gallery" && request.method === "GET") {
       try {
         const fetchLimit = parseInt(env.FETCH_LIMIT || "50", 10);
@@ -53,7 +49,7 @@ export default {
       }
     }
 
-    // 3. POST /api/upload - Accepts base64 images, uploads via ImgBB secret, saves to D1
+    // POST /api/upload - Upload base64 images via ImgBB secret & store in D1
     if (path === "/api/upload" && request.method === "POST") {
       try {
         const { folderName, base64Images } = await request.json();
@@ -70,7 +66,7 @@ export default {
 
         let imageUrls = [];
 
-        // Upload images to ImgBB using the environment variable secret
+        // Upload images to ImgBB via worker secret key
         for (const base64Data of base64Images) {
           const formData = new FormData();
           formData.append("image", base64Data);
@@ -84,7 +80,7 @@ export default {
           if (imgbbJson.success) {
             imageUrls.push(imgbbJson.data.url);
           } else {
-            throw new Error(`ImgBB API Error: ${imgbbJson.error ? imgbbJson.error.message : 'Upload failed'}`);
+            throw new Error(`ImgBB Error: ${imgbbJson.error ? imgbbJson.error.message : 'Upload failed'}`);
           }
         }
 
@@ -117,7 +113,7 @@ export default {
       }
     }
 
-    // 4. DELETE /api/gallery/:id - Delete an image by ID from D1
+    // DELETE /api/gallery/:id - Delete an image by ID from D1
     if (path.startsWith("/api/gallery/") && request.method === "DELETE") {
       try {
         const id = path.split("/").pop();
@@ -146,13 +142,12 @@ export default {
     return new Response("Endpoint Not Found", { status: 404, headers: corsHeaders });
   },
 
-  // Cron trigger for background sync
   async scheduled(event, env, ctx) {
     ctx.waitUntil(syncRaindropToD1(env));
   }
 };
 
-/* --- Helper Functions --- */
+/* --- Helpers --- */
 
 async function incrementUsageCounter(env, count) {
   await env.DB.prepare(`
@@ -183,16 +178,29 @@ async function checkAndResetCounter(env) {
   }
 }
 
+// Fixed D1 storage logic
 async function saveToD1(env, folderName, imageUrls) {
-  let folder = await env.DB.prepare("SELECT id FROM folders WHERE name = ?").bind(folderName).first();
+  let folder = await env.DB.prepare("SELECT id FROM folders WHERE name = ?")
+    .bind(folderName)
+    .first();
   
   if (!folder) {
-    const res = await env.DB.prepare("INSERT INTO folders (name) VALUES (?)").bind(folderName).run();
-    folder = { id: res.meta.last_row_id };
+    await env.DB.prepare("INSERT INTO folders (name) VALUES (?)")
+      .bind(folderName)
+      .run();
+
+    folder = await env.DB.prepare("SELECT id FROM folders WHERE name = ?")
+      .bind(folderName)
+      .first();
+  }
+
+  if (!folder || !folder.id) {
+    throw new Error(`Could not locate or create folder: ${folderName}`);
   }
 
   const stmts = imageUrls.map(url => 
-    env.DB.prepare("INSERT INTO images (folder_id, imgbb_url) VALUES (?, ?)").bind(folder.id, url)
+    env.DB.prepare("INSERT INTO images (folder_id, imgbb_url) VALUES (?, ?)")
+      .bind(folder.id, url)
   );
 
   await env.DB.batch(stmts);
