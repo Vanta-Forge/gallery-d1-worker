@@ -49,7 +49,7 @@ export default {
       }
     }
 
-    // POST /api/upload - Accurate 1-by-1 image splitting
+    // POST /api/upload - Dynamic Batch Calculation & Pure DB-driven Counter
     if (path === "/api/upload" && request.method === "POST") {
       try {
         const { folderName, base64Images } = await request.json();
@@ -61,15 +61,15 @@ export default {
           );
         }
 
-        const requestLimit = parseInt(env.REQUEST_LIMIT || "3", 10);
+        const requestLimit = parseInt(env.REQUEST_LIMIT || "100", 10);
 
-        // Fetch current daily count of images stored today
+        // Fetch counter directly from D1 database (defaults to 0 if null)
         const row = await env.DB.prepare(
           "SELECT value FROM system_stats WHERE key = 'daily_requests'"
         ).first();
-        let currentCounter = row ? parseInt(row.value, 10) : 0;
+        const currentCounter = row ? parseInt(row.value, 10) : 0;
 
-        // 1. Upload all to ImgBB first
+        // 1. Upload images to ImgBB
         let imageUrls = [];
         for (const base64Data of base64Images) {
           const formData = new FormData();
@@ -88,29 +88,30 @@ export default {
           }
         }
 
-        // 2. Separate URLs 1-by-1 against actual image count
+        // 2. Calculate dynamic available slots
         let d1Urls = [];
         let raindropUrls = [];
 
-        for (const url of imageUrls) {
-          if (currentCounter < requestLimit) {
-            d1Urls.push(url);
-            currentCounter++; // Track pure image count
-          } else {
-            raindropUrls.push(url);
-          }
+        const availableSlots = Math.max(0, requestLimit - currentCounter);
+
+        if (availableSlots >= imageUrls.length) {
+          d1Urls = imageUrls;
+        } else {
+          d1Urls = imageUrls.slice(0, availableSlots);
+          raindropUrls = imageUrls.slice(availableSlots);
         }
 
-        // 3. Save D1 items & update system stats counter
+        // 3. Save to D1 & update DB counter directly: currentCounter + d1Urls.length
         if (d1Urls.length > 0) {
+          await saveToD1(env, folderName, d1Urls);
+
+          const newCounter = currentCounter + d1Urls.length;
           await env.DB.prepare(
             "UPDATE system_stats SET value = ? WHERE key = 'daily_requests'"
-          ).bind(currentCounter).run();
-          
-          await saveToD1(env, folderName, d1Urls);
+          ).bind(newCounter).run();
         }
 
-        // 4. Save overflow items to Raindrop
+        // 4. Save overflow to Raindrop
         if (raindropUrls.length > 0) {
           await saveToRaindrop(env, folderName, raindropUrls);
         }
@@ -118,7 +119,7 @@ export default {
         ctx.waitUntil(
           sendTelegramNotification(
             env, 
-            `Processed ${imageUrls.length} image(s): ${d1Urls.length} saved to D1, ${raindropUrls.length} fallback to Raindrop.`
+            `Uploaded ${imageUrls.length} image(s): ${d1Urls.length} to D1, ${raindropUrls.length} to Raindrop.`
           )
         );
 
@@ -127,7 +128,7 @@ export default {
             success: true, 
             d1Saved: d1Urls.length, 
             raindropSaved: raindropUrls.length,
-            totalImagesToday: currentCounter,
+            newCounterValue: currentCounter + d1Urls.length,
             limit: requestLimit
           },
           { headers: corsHeaders }
