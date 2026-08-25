@@ -9,7 +9,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Handle CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
@@ -49,7 +48,7 @@ export default {
       }
     }
 
-    // POST /api/upload - Dynamic Batch Calculation & Pure DB-driven Counter
+    // POST /api/upload - Accurate Batch + 1 Unit Limit Checking
     if (path === "/api/upload" && request.method === "POST") {
       try {
         const { folderName, base64Images } = await request.json();
@@ -63,7 +62,7 @@ export default {
 
         const requestLimit = parseInt(env.REQUEST_LIMIT || "100", 10);
 
-        // Fetch counter directly from D1 database (defaults to 0 if null)
+        // Read DB Counter
         const row = await env.DB.prepare(
           "SELECT value FROM system_stats WHERE key = 'daily_requests'"
         ).first();
@@ -88,30 +87,43 @@ export default {
           }
         }
 
-        // 2. Calculate dynamic available slots
+        // 2. Operational Unit Allocation (Images + 1 Unit for DB Update)
         let d1Urls = [];
         let raindropUrls = [];
 
-        const availableSlots = Math.max(0, requestLimit - currentCounter);
+        // Total available database units remaining today
+        const availableUnits = Math.max(0, requestLimit - currentCounter);
 
-        if (availableSlots >= imageUrls.length) {
-          d1Urls = imageUrls;
+        if (availableUnits <= 1) {
+          // Not enough units left to even write an image + update counter
+          raindropUrls = imageUrls;
         } else {
-          d1Urls = imageUrls.slice(0, availableSlots);
-          raindropUrls = imageUrls.slice(availableSlots);
+          // Max images D1 can take while keeping 1 unit reserved for the counter update
+          const maxD1Images = availableUnits - 1;
+
+          if (imageUrls.length <= maxD1Images) {
+            d1Urls = imageUrls;
+          } else {
+            d1Urls = imageUrls.slice(0, maxD1Images);
+            raindropUrls = imageUrls.slice(maxD1Images);
+          }
         }
 
-        // 3. Save to D1 & update DB counter directly: currentCounter + d1Urls.length
+        // 3. Commit to D1 & Update Counter (Total Added = d1Urls.length + 1)
+        let updatedCounterValue = currentCounter;
         if (d1Urls.length > 0) {
           await saveToD1(env, folderName, d1Urls);
 
-          const newCounter = currentCounter + d1Urls.length;
+          // Counter increases by number of images + 1 for the counter update step itself
+          const unitsUsed = d1Urls.length + 1;
+          updatedCounterValue = currentCounter + unitsUsed;
+
           await env.DB.prepare(
             "UPDATE system_stats SET value = ? WHERE key = 'daily_requests'"
-          ).bind(newCounter).run();
+          ).bind(updatedCounterValue).run();
         }
 
-        // 4. Save overflow to Raindrop
+        // 4. Send remaining overflow images to Raindrop
         if (raindropUrls.length > 0) {
           await saveToRaindrop(env, folderName, raindropUrls);
         }
@@ -128,7 +140,8 @@ export default {
             success: true, 
             d1Saved: d1Urls.length, 
             raindropSaved: raindropUrls.length,
-            newCounterValue: currentCounter + d1Urls.length,
+            unitsConsumed: d1Urls.length > 0 ? d1Urls.length + 1 : 0,
+            newCounterValue: updatedCounterValue,
             limit: requestLimit
           },
           { headers: corsHeaders }
