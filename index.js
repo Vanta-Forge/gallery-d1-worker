@@ -4,16 +4,18 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
+// Target Limit: Exactly 3 images per UTC day stored in D1
+const DAILY_IMAGE_LIMIT = 3;
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // Handle CORS preflight options
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
-
-    await checkAndResetCounter(env);
 
     // GET /api/gallery - Fetch combined D1 & Raindrop images
     if (path === "/api/gallery" && request.method === "GET") {
@@ -21,7 +23,7 @@ export default {
         const fetchLimit = parseInt(env.FETCH_LIMIT || "50", 10);
         
         const d1Images = await env.DB.prepare(`
-          SELECT images.id, images.imgbb_url, folders.name as folder_name 
+          SELECT images.id, images.imgbb_url, folders.name as folder_name, images.created_at
           FROM images 
           JOIN folders ON images.folder_id = folders.id 
           ORDER BY images.id DESC
@@ -30,6 +32,7 @@ export default {
 
         let results = d1Images.results || [];
 
+        // If D1 doesn't have enough images to fill limit, fetch remaining from Raindrop
         if (results.length < fetchLimit) {
           const remainingCapacity = fetchLimit - results.length;
           const raindropItems = await fetchRaindropImages(env, remainingCapacity);
@@ -48,7 +51,7 @@ export default {
       }
     }
 
-    // POST /api/upload - Accurate Batch + 1 Unit Limit Checking
+    // POST /api/upload - UTC Date Limit + Metadata Write Tracking
     if (path === "/api/upload" && request.method === "POST") {
       try {
         const { folderName, base64Images } = await request.json();
@@ -60,15 +63,19 @@ export default {
           );
         }
 
-        const requestLimit = parseInt(env.REQUEST_LIMIT || "100", 10);
+        // 1. Get today's UTC Date (resets automatically at 00:00 UTC)
+        const todayUTC = new Date().toISOString().split("T")[0];
 
-        // Read DB Counter
-        const row = await env.DB.prepare(
-          "SELECT value FROM system_stats WHERE key = 'daily_requests'"
-        ).first();
-        const currentCounter = row ? parseInt(row.value, 10) : 0;
+        // 2. Count images stored in D1 so far today
+        const countResult = await env.DB.prepare(`
+          SELECT COUNT(*) as total 
+          FROM images 
+          WHERE DATE(created_at) = ?
+        `).bind(todayUTC).first();
 
-        // 1. Upload images to ImgBB
+        const imagesStoredToday = countResult ? parseInt(countResult.total, 10) : 0;
+
+        // 3. Upload images to ImgBB
         let imageUrls = [];
         for (const base64Data of base64Images) {
           const formData = new FormData();
@@ -87,43 +94,26 @@ export default {
           }
         }
 
-        // 2. Operational Unit Allocation (Images + 1 Unit for DB Update)
+        // 4. Calculate available D1 slots remaining today
+        const availableSlots = Math.max(0, DAILY_IMAGE_LIMIT - imagesStoredToday);
+
         let d1Urls = [];
         let raindropUrls = [];
 
-        // Total available database units remaining today
-        const availableUnits = Math.max(0, requestLimit - currentCounter);
-
-        if (availableUnits <= 1) {
-          // Not enough units left to even write an image + update counter
-          raindropUrls = imageUrls;
+        if (availableSlots >= imageUrls.length) {
+          d1Urls = imageUrls;
         } else {
-          // Max images D1 can take while keeping 1 unit reserved for the counter update
-          const maxD1Images = availableUnits - 1;
-
-          if (imageUrls.length <= maxD1Images) {
-            d1Urls = imageUrls;
-          } else {
-            d1Urls = imageUrls.slice(0, maxD1Images);
-            raindropUrls = imageUrls.slice(maxD1Images);
-          }
+          d1Urls = imageUrls.slice(0, availableSlots);
+          raindropUrls = imageUrls.slice(availableSlots);
         }
 
-        // 3. Commit to D1 & Update Counter (Total Added = d1Urls.length + 1)
-        let updatedCounterValue = currentCounter;
+        // 5. Save images to D1 & track physical row writes
+        let d1WriteMeta = { rows_written: 0 };
         if (d1Urls.length > 0) {
-          await saveToD1(env, folderName, d1Urls);
-
-          // Counter increases by number of images + 1 for the counter update step itself
-          const unitsUsed = d1Urls.length + 1;
-          updatedCounterValue = currentCounter + unitsUsed;
-
-          await env.DB.prepare(
-            "UPDATE system_stats SET value = ? WHERE key = 'daily_requests'"
-          ).bind(updatedCounterValue).run();
+          d1WriteMeta = await saveToD1(env, folderName, d1Urls);
         }
 
-        // 4. Send remaining overflow images to Raindrop
+        // 6. Save overflow images to Raindrop
         if (raindropUrls.length > 0) {
           await saveToRaindrop(env, folderName, raindropUrls);
         }
@@ -140,9 +130,9 @@ export default {
             success: true, 
             d1Saved: d1Urls.length, 
             raindropSaved: raindropUrls.length,
-            unitsConsumed: d1Urls.length > 0 ? d1Urls.length + 1 : 0,
-            newCounterValue: updatedCounterValue,
-            limit: requestLimit
+            imagesStoredToday: imagesStoredToday + d1Urls.length,
+            dailyLimit: DAILY_IMAGE_LIMIT,
+            actualRowsWritten: d1WriteMeta.rows_written
           },
           { headers: corsHeaders }
         );
@@ -166,10 +156,15 @@ export default {
           );
         }
 
+        // Delete execution returns write metadata
         const result = await env.DB.prepare("DELETE FROM images WHERE id = ?").bind(id).run();
 
         return Response.json(
-          { success: true, message: `Image ${id} deleted successfully.`, meta: result.meta },
+          { 
+            success: true, 
+            message: `Image ${id} deleted successfully.`, 
+            rowsWrittenByDelete: result.meta.rows_written 
+          },
           { headers: corsHeaders }
         );
       } catch (error) {
@@ -190,30 +185,20 @@ export default {
 
 /* --- Helpers --- */
 
-async function checkAndResetCounter(env) {
-  const row = await env.DB.prepare(
-    "SELECT last_reset FROM system_stats WHERE key = 'daily_requests'"
-  ).first();
-
-  const today = new Date().toISOString().split("T")[0];
-  if (row && row.last_reset !== today) {
-    await env.DB.prepare(`
-      UPDATE system_stats 
-      SET value = 0, last_reset = ? 
-      WHERE key = 'daily_requests'
-    `).bind(today).run();
-  }
-}
-
 async function saveToD1(env, folderName, imageUrls) {
+  let totalRowsWritten = 0;
+
+  // 1. Get or create Folder
   let folder = await env.DB.prepare("SELECT id FROM folders WHERE name = ?")
     .bind(folderName)
     .first();
   
   if (!folder) {
-    await env.DB.prepare("INSERT INTO folders (name) VALUES (?)")
+    const folderInsert = await env.DB.prepare("INSERT INTO folders (name) VALUES (?)")
       .bind(folderName)
       .run();
+
+    totalRowsWritten += folderInsert.meta.rows_written || 0;
 
     folder = await env.DB.prepare("SELECT id FROM folders WHERE name = ?")
       .bind(folderName)
@@ -224,12 +209,20 @@ async function saveToD1(env, folderName, imageUrls) {
     throw new Error(`Could not locate or create folder: ${folderName}`);
   }
 
+  // 2. Insert Images Batch
   const stmts = imageUrls.map(url => 
-    env.DB.prepare("INSERT INTO images (folder_id, imgbb_url) VALUES (?, ?)")
+    env.DB.prepare("INSERT INTO images (folder_id, imgbb_url, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)")
       .bind(folder.id, url)
   );
 
-  await env.DB.batch(stmts);
+  const batchResults = await env.DB.batch(stmts);
+  
+  // Accumulate total database write modifications (inserts + index updates)
+  batchResults.forEach(res => {
+    totalRowsWritten += res.meta.rows_written || 0;
+  });
+
+  return { rows_written: totalRowsWritten };
 }
 
 async function saveToRaindrop(env, folderName, imageUrls) {
